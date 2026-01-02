@@ -62,17 +62,24 @@ export const extractTransactionsFromDocument = async (
      throw new Error("System Configuration Error: API Key is missing.");
   }
 
+  // Define modelName here so it is available in catch block
+  let modelName = 'gemini-flash-latest'; 
+
   try {
     // Remove header data if present
     const cleanBase64 = base64Data.split(',')[1] || base64Data;
-
+    
+    // Check approximate size (Base64 is ~1.33x original size)
+    const approximateSizeInMB = (cleanBase64.length * 0.75) / (1024 * 1024);
+    
     // 1. Model Selection
-    // STRICTLY using models allowed by the environment to avoid 404 errors.
     // 'gemini-flash-latest' for speed.
     // 'gemini-3-pro-preview' for reasoning/large context.
-    let modelName = 'gemini-flash-latest'; 
     
-    if (provider === ModelProvider.GEMINI_PRO || provider === ModelProvider.GROK_BETA) {
+    // AUTO-SCALING: If file is larger than 10MB (likely complex or many pages), force Pro model.
+    // Also use Pro if user explicitly selected Grok/Pro.
+    if (approximateSizeInMB > 10 || provider === ModelProvider.GEMINI_PRO || provider === ModelProvider.GROK_BETA) {
+      console.log("Large document detected or Pro mode selected. Switching to Gemini Pro for high-context analysis.");
       modelName = 'gemini-3-pro-preview'; 
     }
 
@@ -87,15 +94,20 @@ export const extractTransactionsFromDocument = async (
             }
           },
           {
-            text: `You are a data extraction engine. Analyze this bank statement image/pdf.
+            text: `You are a Federal Auditor extraction engine. Analyze this bank statement.
 
-            TASK: Extract all financial transactions.
-            OUTPUT: A strict JSON array. No markdown, no explanations.
+            CRITICAL INSTRUCTION: This document may contain UP TO 500 PAGES. 
+            You must extract transactions from PAGE 1 all the way to the LAST PAGE.
+            Do NOT stop after the first page. Do NOT summarize.
+            
+            Scan the entire document. If you see "Page 1 of 500", ensure you reach Page 500.
+            
+            TASK: Extract all financial transactions into a single JSON array.
             
             FIELDS:
-            - date: "YYYY-MM-DD"
-            - description: String (Clean up codes)
-            - amount: Number (Positive value)
+            - date: "YYYY-MM-DD" (Use the date of the transaction)
+            - description: String (Clean up codes, remove timestamps if mixed in)
+            - amount: Number (Positive value, no currency symbols)
             - type: "CREDIT" (Inflow/Deposit) or "DEBIT" (Outflow/Withdrawal)
 
             If the document is unclear or contains no transactions, return an empty array [].`
@@ -134,16 +146,23 @@ export const extractTransactionsFromDocument = async (
         console.warn("Received empty response, retrying...");
         return extractTransactionsFromDocument(base64Data, mimeType, provider, retryCount + 1);
       }
-      // If still empty, it's likely a blank document or completely blocked.
-      // Return empty array instead of crashing, but log it.
       console.warn("The AI engine returned an empty response after retrying. Returning empty transaction list.");
       return [];
     }
 
     // 3. Robust Parsing
     try {
-      // Remove any potential markdown formatting that slips through
-      const cleanJson = jsonText.replace(/```json/g, '').replace(/```/g, '').trim();
+      let cleanJson = jsonText.replace(/```json/g, '').replace(/```/g, '').trim();
+
+      // JSON Repair Strategy:
+      if (cleanJson.startsWith('[') && !cleanJson.endsWith(']')) {
+        const lastClosingBrace = cleanJson.lastIndexOf('}');
+        if (lastClosingBrace !== -1) {
+           console.warn("Response truncated. Repairing JSON...");
+           cleanJson = cleanJson.substring(0, lastClosingBrace + 1) + ']';
+        }
+      }
+
       return JSON.parse(cleanJson) as Transaction[];
     } catch (parseError) {
       console.error("JSON Parse Error:", parseError, jsonText);
@@ -160,25 +179,21 @@ export const extractTransactionsFromDocument = async (
     if (errStr.includes("api key") || errStr.includes("403")) {
         friendlyMessage = "Access Denied: Invalid or Missing API Key.";
     } else if (errStr.includes("404") || errStr.includes("not found")) {
-        friendlyMessage = "Engine Error: The selected model is not available. Please try switching between Flash and Grok.";
+        friendlyMessage = "Engine Error: The selected model is not available. Please try switching between Flash and Grok/Pro.";
     } else if (errStr.includes("quota") || errStr.includes("429")) {
         friendlyMessage = "Traffic limit exceeded. Retrying automatically usually fixes this.";
-    } else if (errStr.includes("token count") || errStr.includes("1048576") || errStr.includes("too large")) {
-        // Specifically handle token limits
-        if (provider === ModelProvider.GEMINI_FLASH) {
-          friendlyMessage = "This document is too large for the Flash engine. Please switch to 'Grok (Beta)' for higher capacity.";
-        } else {
-          friendlyMessage = "This document exceeds the 2 Million token limit. Please split the PDF.";
-        }
+    } else if (errStr.includes("too large") || errStr.includes("payload") || errStr.includes("413")) {
+        // Handle payload limits specifically
+        friendlyMessage = "The document size exceeds the secure transmission limit (20MB encoded). Please try compressing your PDF or converting to grayscale to reduce size.";
+    } else if (errStr.includes("token count") || errStr.includes("limit")) {
+         friendlyMessage = "This document is extremely dense. We have automatically switched to High-Capacity mode, but it may still be too large. Please split the PDF.";
     } else if (errStr.includes("dependency") || errStr.includes("internal")) {
         friendlyMessage = "The document structure is too complex for the engine. Please try converting to an Image or creating a simpler PDF.";
-    } else if (errStr.includes("security") || errStr.includes("blocked")) {
-        friendlyMessage = "The document was flagged by security filters. Try a different file.";
     }
 
     // Prefix for Grok to maintain branding
-    if (provider === ModelProvider.GROK_BETA) {
-        friendlyMessage = `[Grok Beta] ${friendlyMessage}`;
+    if (provider === ModelProvider.GROK_BETA || modelName === 'gemini-3-pro-preview') {
+        friendlyMessage = `[Pro Audit] ${friendlyMessage}`;
     }
 
     throw new Error(friendlyMessage);
