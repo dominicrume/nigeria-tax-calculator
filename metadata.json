@@ -1,0 +1,5 @@
+{
+  "name": "NairaSync - Tax & OCR",
+  "description": "A smart financial tool for Nigerian freelancers and SMBs. Upload bank statements to automatically extract transactions, calculate tax obligations, and export data to CSV using Gemini AI.",
+  "requestFramePermissions": []
+}
